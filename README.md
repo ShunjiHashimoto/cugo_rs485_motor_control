@@ -1,0 +1,2 @@
+# cugo_rs485_motor_control
+CuGoV4をRS485を使って制御するためのリポジトリ
