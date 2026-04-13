@@ -59,26 +59,21 @@ python3 -m pip install pyserial
 | `--baudrate` | `9600` | 通信ボーレート |
 | `--left-slave` | `2` | 左モータのModbusスレーブID |
 | `--right-slave` | `1` | 右モータのModbusスレーブID |
+| `--left-dir-sign` | `-1` | `run` の左方向符号（`-1`で反転） |
+| `--right-dir-sign` | `1` | `run` の右方向符号（`-1`で反転） |
+| `--debug` | `OFF` | 速度情報のリアルタイム表示を有効化 |
+| `--debug-interval` | `0.5` | リアルタイム表示周期 [s]（`--debug`時のみ） |
 
 | コマンド | 引数 | 概要 |
 | --- | --- | --- |
 | `set-speed` | `--left RPM --right RPM` | 左右の速度を同時設定 |
-| `run` | `--left-dir fwd/rev/stop --right-dir fwd/rev/stop` | 左右の方向を同時指令 |
+| `run` | `--left-dir fwd/rev/stop --right-dir fwd/rev/stop [--left-rpm RPM --right-rpm RPM]` | 左右の方向を同時指令（任意で同時に速度設定） |
 | `stop` | `--instant`（任意） | 左右を同時停止 |
-| `read-speed` | なし | 左右の設定速度を読み取り |
+| `read-speed` | なし | 左右の速度情報（設定/指令/フィードバック）を読み取り |
+| `read-speed-setting` | なし | 左右の設定速度（Speed No.2）を読み取り |
 
 固定値: parity=`E`、stopbits=`1`、timeout=`0.3` 秒
-
-### `test/demo_500rpm_3sec.py`
-
-| 引数 | デフォルト | 概要 |
-| --- | --- | --- |
-| `--port` | `/dev/ttyUSB0` | シリアルポート |
-| `--slave` | `1` | ModbusスレーブID |
-| `--baudrate` | `9600` | 通信ボーレート |
-| `--dir` | `fwd` | デモ方向（`fwd`/`rev`） |
-
-固定値: parity=`E`、stopbits=`1`、timeout=`0.3` 秒
+サブコマンド未指定時は `read-speed-setting` が実行されます。
 
 ### 1) 左右の速度設定
 
@@ -92,6 +87,15 @@ python3 scripts/main.py --port /dev/ttyUSB0 --left-slave 2 --right-slave 1 set-s
 python3 scripts/main.py --port /dev/ttyUSB0 --left-slave 2 --right-slave 1 run --left-dir fwd --right-dir fwd
 ```
 
+### 2-1) 速度を同時に指令して正転
+
+```bash
+python3 scripts/main.py --port /dev/ttyUSB0 --left-slave 2 --right-slave 1 run --left-dir fwd --right-dir fwd --left-rpm 500 --right-rpm 500
+```
+
+`run` コマンドは、デフォルトで CuGo向けに左モータの向きを反転して扱います（`--left-dir-sign -1`）。  
+モータ単体の向きをそのまま使いたい場合は `--left-dir-sign 1 --right-dir-sign 1` を指定してください。
+
 ### 3) 旋回（左正転・右逆転）
 
 ```bash
@@ -104,12 +108,16 @@ python3 scripts/main.py --port /dev/ttyUSB0 --left-slave 2 --right-slave 1 run -
 python3 scripts/main.py --port /dev/ttyUSB0 --left-slave 2 --right-slave 1 stop
 ```
 
-## デモスクリプト
-
-500 rpm で 3 秒回して停止するデモは、次を使ってください。
+### 5) 左右の速度情報を読み取り
 
 ```bash
-python3 test/demo_500rpm_3sec.py --port /dev/ttyUSB0 --slave 1 --dir fwd
+python3 scripts/main.py --port /dev/ttyUSB0 --left-slave 2 --right-slave 1 read-speed
+```
+
+### 6) 速度情報をリアルタイム表示（Ctrl+Cで終了）
+
+```bash
+python3 scripts/main.py --port /dev/ttyUSB0 --left-slave 2 --right-slave 1 --debug --debug-interval 0.5 read-speed
 ```
 
 ## モジュール構成
@@ -120,5 +128,3 @@ python3 test/demo_500rpm_3sec.py --port /dev/ttyUSB0 --slave 1 --dir fwd
   - Modbus RTUフレーム生成/CRC/応答検証
 - `scripts/cugo_rs485_motor_control/blv_motor.py`
   - BLV向け高レベル制御（速度・正逆転・停止）
-- `test/demo_500rpm_3sec.py`
-  - 500 rpm / 3 sec の動作確認用デモ

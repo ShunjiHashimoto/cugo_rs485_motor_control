@@ -9,6 +9,8 @@ class BlvMotorController:
     """High-level control helper for BLV/BLVD via Modbus RTU."""
 
     DRIVER_INPUT_COMMAND_LOWER = 0x007D
+    COMMAND_SPEED_UPPER = 0x00C8
+    FEEDBACK_SPEED_UPPER = 0x00CE
     ROTATION_SPEED_NO0_UPPER = 0x0480
 
     BIT_M0 = 1 << 0
@@ -33,8 +35,15 @@ class BlvMotorController:
     def read_rotation_speed_setting(self, op_no: int) -> int:
         self._validate_op_no(op_no)
         upper_addr = self.ROTATION_SPEED_NO0_UPPER + op_no * 2
-        values = self.client.read_holding_registers(self.slave_id, upper_addr, 2)
-        return ((values[0] & 0xFFFF) << 16) | (values[1] & 0xFFFF)
+        return self._read_uint32(upper_addr)
+
+    def read_command_speed_rpm(self) -> int:
+        """Read monitor command speed (00C8h/00C9h) in r/min."""
+        return self._read_int32(self.COMMAND_SPEED_UPPER)
+
+    def read_feedback_speed_rpm(self) -> int:
+        """Read monitor feedback speed (00CEh/00CFh) in r/min."""
+        return self._read_int32(self.FEEDBACK_SPEED_UPPER)
 
     def run_forward(self, op_no: int = 2, deceleration_stop: bool = True) -> None:
         cmd = self._op_no_to_cmd_bits(op_no) | self.BIT_FWD
@@ -90,3 +99,13 @@ class BlvMotorController:
         if op_no & 0b100:
             bits |= cls.BIT_M2
         return bits
+
+    def _read_uint32(self, upper_addr: int) -> int:
+        values = self.client.read_holding_registers(self.slave_id, upper_addr, 2)
+        return ((values[0] & 0xFFFF) << 16) | (values[1] & 0xFFFF)
+
+    def _read_int32(self, upper_addr: int) -> int:
+        value = self._read_uint32(upper_addr)
+        if value & 0x80000000:
+            value -= 0x100000000
+        return value
