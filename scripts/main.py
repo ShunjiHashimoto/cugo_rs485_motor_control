@@ -11,13 +11,20 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
+from config import (
+    DEFAULT_LEFT_MOTOR_SIGN,
+    DEFAULT_LEFT_SLAVE_ID,
+    DEFAULT_MODBUS_TIMEOUT_SEC,
+    DEFAULT_OP_NO,
+    DEFAULT_RIGHT_MOTOR_SIGN,
+    DEFAULT_RIGHT_SLAVE_ID,
+    DEFAULT_SERIAL_BAUDRATE,
+    DEFAULT_SERIAL_PORT,
+    FIXED_PARITY,
+    FIXED_STOPBITS,
+)
 from cugo_rs485_motor_control.blv_motor import BlvMotorController
 from cugo_rs485_motor_control.modbus_rtu import ModbusError, ModbusRtuClient
-
-DEFAULT_OP_NO = 2
-FIXED_PARITY = "E"
-FIXED_STOPBITS = 1
-FIXED_TIMEOUT = 0.3
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -25,22 +32,22 @@ def build_parser() -> argparse.ArgumentParser:
         prog="main.py",
         description="Dual BLVD10KM control (left/right) over RS485 Modbus RTU",
     )
-    parser.add_argument("--port", default="/dev/ttyUSB0", help="serial port path")
-    parser.add_argument("--baudrate", type=int, default=9600, help="serial baudrate")
-    parser.add_argument("--left-slave", type=int, default=2, help="left motor slave ID")
-    parser.add_argument("--right-slave", type=int, default=1, help="right motor slave ID")
+    parser.add_argument("--port", default=DEFAULT_SERIAL_PORT, help="serial port path")
+    parser.add_argument("--baudrate", type=int, default=DEFAULT_SERIAL_BAUDRATE, help="serial baudrate")
+    parser.add_argument("--left-slave", type=int, default=DEFAULT_LEFT_SLAVE_ID, help="left motor slave ID")
+    parser.add_argument("--right-slave", type=int, default=DEFAULT_RIGHT_SLAVE_ID, help="right motor slave ID")
     parser.add_argument(
         "--left-dir-sign",
         type=int,
         choices=(-1, 1),
-        default=-1,
+        default=DEFAULT_LEFT_MOTOR_SIGN,
         help="left motor direction sign for run command (-1: invert, 1: normal)",
     )
     parser.add_argument(
         "--right-dir-sign",
         type=int,
         choices=(-1, 1),
-        default=1,
+        default=DEFAULT_RIGHT_MOTOR_SIGN,
         help="right motor direction sign for run command (-1: invert, 1: normal)",
     )
     parser.add_argument(
@@ -105,7 +112,7 @@ def main(argv: list[str] | None = None) -> int:
             baudrate=args.baudrate,
             parity=FIXED_PARITY,
             stopbits=FIXED_STOPBITS,
-            timeout=FIXED_TIMEOUT,
+            timeout=DEFAULT_MODBUS_TIMEOUT_SEC,
         ) as client:
             left = BlvMotorController(client, slave_id=args.left_slave)
             right = BlvMotorController(client, slave_id=args.right_slave)
