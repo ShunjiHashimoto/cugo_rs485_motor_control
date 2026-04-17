@@ -146,8 +146,11 @@ sudo python3 scripts/propo_control.py --port /dev/ttyUSB0 --left-slave 2 --right
 - `--max-v-kmh`: 最大並進速度 [km/h]（デフォルト `1.89`）
 - `--max-w-radps`: 最大角速度 [rad/s]
 - `--h-reduction`: `CH-H`最小時の出力倍率（`0.0 < value <= 0.5`）
+- `--neutral-deadband-us`: 中立デッドバンド[us]（デフォルト `60`）
+- `--axis-zero-eps`: 正規化後の軸値がしきい値以下なら強制0（デフォルト `0.05`）
 - `--v-axis` / `--w-axis` / `--swap-axes`: 軸割り当て
 - `--invert-v` / `--no-invert-w`: 符号調整
+- 後進時は操舵方向を反転し、スティックの左右と車体の旋回感を合わせる
 - `--verbose`: 毎周期ログ表示
 - `--dry-run`: RS485送信なしで入力と演算のみ確認
 

@@ -9,8 +9,12 @@ from pathlib import Path
 from typing import Dict
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-if str(SCRIPT_DIR) not in sys.path:
-    sys.path.insert(0, str(SCRIPT_DIR))
+PROJECT_ROOT = SCRIPT_DIR.parent
+SCRIPTS_DIR = PROJECT_ROOT / "scripts"
+for path in (SCRIPT_DIR, SCRIPTS_DIR):
+    path_str = str(path)
+    if path_str not in sys.path:
+        sys.path.insert(0, path_str)
 
 from propo_control import RcChannelConfig, RcPwmReceiver
 

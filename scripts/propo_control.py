@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import deque
 import math
 import signal
 import sys
@@ -28,7 +29,7 @@ from config import (
     FIXED_STOPBITS,
 )
 from cugo_rs485_motor_control.blv_motor import BlvMotorController
-from cugo_rs485_motor_control.modbus_rtu import ModbusError, ModbusRtuClient
+from cugo_rs485_motor_control.modbus_rtu import ModbusError, ModbusRtuClient, ModbusTimeoutError
 
 try:
     import RPi.GPIO as GPIO
@@ -45,6 +46,9 @@ DEFAULT_MAX_W_RADPS = 3.14/2
 MIN_ACCEPTED_PULSE_US = 750
 MAX_ACCEPTED_PULSE_US = 2250
 DEFAULT_BUZZER_PIN = 2
+DEFAULT_STARTUP_RETRY_DELAY_SEC = 1.0
+DEFAULT_NEUTRAL_GLITCH_GUARD_US = 80
+DEFAULT_GLITCH_CONFIRM_SAMPLES = 3
 
 
 @dataclass(frozen=True)
@@ -79,7 +83,7 @@ class MotorBridgeConfig:
     reduction_ratio: float = 20.0
     max_rpm: float = 2600.0
     min_rpm: float = 80.0
-    anti_creep_start_rpm: float = 200.0
+    anti_creep_start_rpm: float = 300.0
     left_motor_sign: int = DEFAULT_LEFT_MOTOR_SIGN
     right_motor_sign: int = DEFAULT_RIGHT_MOTOR_SIGN
     deceleration_stop: bool = True
@@ -95,8 +99,14 @@ class RcPwmReceiver:
 
         self._channel_config = channel_config
         self._signal_timeout_ns = int(signal_timeout_ms * 1_000_000)
+        self._neutral_glitch_guard_us = DEFAULT_NEUTRAL_GLITCH_GUARD_US
+        self._glitch_confirm_samples = max(1, DEFAULT_GLITCH_CONFIRM_SAMPLES)
         self._lock = threading.Lock()
         self._pulse_us = {name: cfg.center_pulse_us for name, cfg in channel_config.items()}
+        self._pulse_history_us = {name: deque(maxlen=3) for name in channel_config}
+        self._pending_pulse_history_us = {
+            name: deque(maxlen=self._glitch_confirm_samples) for name in channel_config
+        }
         self._valid = {name: False for name in channel_config}
         self._last_update_ns = {name: 0 for name in channel_config}
         self._rise_timestamp_ns = {name: None for name in channel_config}
@@ -129,7 +139,9 @@ class RcPwmReceiver:
 
             width_us = int((timestamp_ns - rise_ns) / 1000)
             if MIN_ACCEPTED_PULSE_US <= width_us <= MAX_ACCEPTED_PULSE_US:
-                self._pulse_us[name] = width_us
+                filtered_pulse_us = self._filter_pulse_us(name, width_us)
+                if filtered_pulse_us is not None:
+                    self._pulse_us[name] = filtered_pulse_us
                 self._valid[name] = True
                 self._last_update_ns[name] = timestamp_ns
             else:
@@ -157,6 +169,34 @@ class RcPwmReceiver:
             except RuntimeError:
                 pass
         GPIO.cleanup(pins)
+
+    @staticmethod
+    def _median_pulse_us(history: deque[int]) -> int:
+        values = sorted(history)
+        return values[len(values) // 2]
+
+    def _filter_pulse_us(self, name: str, width_us: int) -> Optional[int]:
+        config = self._channel_config[name]
+        current_pulse_us = self._pulse_us[name]
+        history = self._pulse_history_us[name]
+        pending_history = self._pending_pulse_history_us[name]
+
+        current_near_center = abs(current_pulse_us - config.center_pulse_us) <= self._neutral_glitch_guard_us
+        new_far_from_center = abs(width_us - config.center_pulse_us) > self._neutral_glitch_guard_us
+
+        if current_near_center and new_far_from_center:
+            pending_history.append(width_us)
+            if len(pending_history) < self._glitch_confirm_samples:
+                return None
+
+            history.clear()
+            history.extend(pending_history)
+            pending_history.clear()
+            return self._median_pulse_us(history)
+
+        pending_history.clear()
+        history.append(width_us)
+        return self._median_pulse_us(history)
 
 
 class StartupBuzzer:
@@ -188,12 +228,14 @@ class VehicleControl:
     def __init__(
         self,
         neutral_deadband_us: int,
+        axis_zero_epsilon: float,
         output_scale_steps: int,
         min_output_scale: float,
         throttle_expo: float,
         steering_expo: float,
     ):
         self._neutral_deadband_us = neutral_deadband_us
+        self._axis_zero_epsilon = max(0.0, min(1.0, axis_zero_epsilon))
         self._output_scale_steps = max(1, output_scale_steps)
         self._min_output_scale = min_output_scale
         self._throttle_expo = throttle_expo
@@ -209,18 +251,20 @@ class VehicleControl:
             cmd.output_scale = self._output_scale
             return cmd
 
-        cmd.axis_c = self._normalize_axis(
+        axis_c_raw = self._normalize_axis(
             frame.pulse_us["C"],
             channel_config["C"],
             self._neutral_deadband_us,
             self._throttle_expo,
         )
-        cmd.axis_d = self._normalize_axis(
+        axis_d_raw = self._normalize_axis(
             frame.pulse_us["D"],
             channel_config["D"],
             self._neutral_deadband_us,
             self._steering_expo,
         )
+        cmd.axis_c = self._apply_axis_zero_clamp(axis_c_raw)
+        cmd.axis_d = self._apply_axis_zero_clamp(axis_d_raw)
         self._speed_level = self._scale_level(
             frame.pulse_us["H"],
             channel_config["H"],
@@ -258,6 +302,11 @@ class VehicleControl:
         level = int(round(normalized * output_scale_steps))
         return max(0, min(output_scale_steps, level))
 
+    def _apply_axis_zero_clamp(self, axis_value: float) -> float:
+        if abs(axis_value) <= self._axis_zero_epsilon:
+            return 0.0
+        return axis_value
+
 
 class Rs485DualMotorBridge:
     def __init__(
@@ -289,6 +338,11 @@ class Rs485DualMotorBridge:
 
         self._config = config
         self._dry_run = dry_run
+        self._port = port
+        self._baudrate = baudrate
+        self._timeout = timeout
+        self._left_slave = left_slave
+        self._right_slave = right_slave
         self._left_state: Optional[Tuple[int, str]] = None
         self._right_state: Optional[Tuple[int, str]] = None
 
@@ -296,26 +350,24 @@ class Rs485DualMotorBridge:
         self._left_motor: Optional[BlvMotorController] = None
         self._right_motor: Optional[BlvMotorController] = None
 
-        if not dry_run:
-            self._client = ModbusRtuClient.from_params(
-                port=port,
-                baudrate=baudrate,
-                parity=FIXED_PARITY,
-                stopbits=FIXED_STOPBITS,
-                timeout=timeout,
-            )
-            self._client.connect()
-            self._left_motor = BlvMotorController(self._client, slave_id=left_slave)
-            self._right_motor = BlvMotorController(self._client, slave_id=right_slave)
-
-        self.stop(force=True)
+        try:
+            self._connect()
+            self.stop(force=True)
+        except Exception:
+            self._close_client()
+            raise
 
     def close(self) -> None:
         try:
             self.stop(force=True)
         finally:
-            if self._client is not None:
-                self._client.close()
+            self._close_client()
+
+    def reconnect(self) -> None:
+        self._close_client()
+        self._left_state = None
+        self._right_state = None
+        self._connect()
 
     def apply_body_velocity(self, v_mps: float, w_radps: float) -> Tuple[float, float, float, float]:
         limited_v, limited_w, left_motor_rpm, right_motor_rpm = self._limit_body_velocity(v_mps, w_radps)
@@ -409,6 +461,27 @@ class Rs485DualMotorBridge:
         else:
             self._right_state = state
 
+    def _connect(self) -> None:
+        if self._dry_run:
+            return
+        self._client = ModbusRtuClient.from_params(
+            port=self._port,
+            baudrate=self._baudrate,
+            parity=FIXED_PARITY,
+            stopbits=FIXED_STOPBITS,
+            timeout=self._timeout,
+        )
+        self._client.connect()
+        self._left_motor = BlvMotorController(self._client, slave_id=self._left_slave)
+        self._right_motor = BlvMotorController(self._client, slave_id=self._right_slave)
+
+    def _close_client(self) -> None:
+        if self._client is not None:
+            self._client.close()
+        self._client = None
+        self._left_motor = None
+        self._right_motor = None
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -471,7 +544,13 @@ def build_parser() -> argparse.ArgumentParser:
         default=0.5,
         help="output scale at minimum CH-H (0.0 < value <= 0.5)",
     )
-    parser.add_argument("--neutral-deadband-us", type=int, default=40, help="neutral deadband in usec")
+    parser.add_argument("--neutral-deadband-us", type=int, default=60, help="neutral deadband in usec")
+    parser.add_argument(
+        "--axis-zero-eps",
+        type=float,
+        default=0.08,
+        help="force axis output to zero when |normalized axis| <= value (0.0..1.0)",
+    )
     parser.add_argument("--throttle-expo", type=float, default=1.2, help="expo for CH-C")
     parser.add_argument("--steering-expo", type=float, default=1.0, help="expo for CH-D")
     parser.add_argument("--output-scale-steps", type=int, default=5, help="CH-H output scale steps")
@@ -596,6 +675,8 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--signal-timeout-ms must be > 0")
     if args.output_scale_steps < 1:
         raise ValueError("--output-scale-steps must be >= 1")
+    if not (0.0 <= args.axis_zero_eps <= 1.0):
+        raise ValueError("--axis-zero-eps must satisfy 0.0 <= value <= 1.0")
     if args.enable_rate_limit:
         if args.v_accel_limit_mps2 <= 0.0:
             raise ValueError("--v-accel-limit-mps2 must be > 0 when --enable-rate-limit is set")
@@ -633,32 +714,11 @@ def main(argv: Optional[list[str]] = None) -> int:
         buzzer = StartupBuzzer(pin=args.buzzer_pin)
         control = VehicleControl(
             neutral_deadband_us=args.neutral_deadband_us,
+            axis_zero_epsilon=args.axis_zero_eps,
             output_scale_steps=args.output_scale_steps,
             min_output_scale=args.h_reduction,
             throttle_expo=args.throttle_expo,
             steering_expo=args.steering_expo,
-        )
-
-        bridge = Rs485DualMotorBridge(
-            port=args.port,
-            baudrate=args.baudrate,
-            timeout=args.timeout,
-            left_slave=args.left_slave,
-            right_slave=args.right_slave,
-            config=MotorBridgeConfig(
-                op_no=DEFAULT_OP_NO,
-                wheel_radius_left=args.wheel_radius_left,
-                wheel_radius_right=args.wheel_radius_right,
-                tread=args.tread,
-                reduction_ratio=args.reduction_ratio,
-                max_rpm=args.max_rpm,
-                min_rpm=args.min_rpm,
-                anti_creep_start_rpm=args.anti_creep_start_rpm,
-                left_motor_sign=args.left_motor_sign,
-                right_motor_sign=args.right_motor_sign,
-                deceleration_stop=not args.instant_stop_mode,
-            ),
-            dry_run=args.dry_run,
         )
 
         running = True
@@ -689,6 +749,43 @@ def main(argv: Optional[list[str]] = None) -> int:
         # Startup beep pattern follows tang2dne_handler/scripts/indicator.py defaults.
         buzzer.beep()
 
+        bridge_config = MotorBridgeConfig(
+            op_no=DEFAULT_OP_NO,
+            wheel_radius_left=args.wheel_radius_left,
+            wheel_radius_right=args.wheel_radius_right,
+            tread=args.tread,
+            reduction_ratio=args.reduction_ratio,
+            max_rpm=args.max_rpm,
+            min_rpm=args.min_rpm,
+            anti_creep_start_rpm=args.anti_creep_start_rpm,
+            left_motor_sign=args.left_motor_sign,
+            right_motor_sign=args.right_motor_sign,
+            deceleration_stop=not args.instant_stop_mode,
+        )
+
+        bridge = None
+        while running and bridge is None:
+            try:
+                bridge = Rs485DualMotorBridge(
+                    port=args.port,
+                    baudrate=args.baudrate,
+                    timeout=args.timeout,
+                    left_slave=args.left_slave,
+                    right_slave=args.right_slave,
+                    config=bridge_config,
+                    dry_run=args.dry_run,
+                )
+            except ModbusTimeoutError as exc:
+                print(
+                    f"[WARN] Startup Modbus timeout: {exc}. "
+                    f"Retrying in {DEFAULT_STARTUP_RETRY_DELAY_SEC:.1f}s",
+                    file=sys.stderr,
+                )
+                time.sleep(DEFAULT_STARTUP_RETRY_DELAY_SEC)
+
+        if bridge is None:
+            return 0
+
         last_signal_healthy = True
         last_invalid_log = 0.0
         last_loop_time = time.monotonic()
@@ -702,65 +799,83 @@ def main(argv: Optional[list[str]] = None) -> int:
             frame = receiver.read()
             cmd = control.update(frame, channel_config)
 
-            if not cmd.signal_healthy:
-                bridge.stop()
-                now = time.monotonic()
-                should_log = (
-                    last_signal_healthy
-                    or last_invalid_log == 0.0
-                    or (now - last_invalid_log) >= 5.0
-                )
-                if should_log:
-                    print(
-                        "[WARN] RC signal invalid "
-                        f"ch-C={frame.pulse_us['C']} "
-                        f"ch-D={frame.pulse_us['D']} "
-                        f"ch-H={frame.pulse_us['H']}"
+            try:
+                if not cmd.signal_healthy:
+                    bridge.stop()
+                    now = time.monotonic()
+                    should_log = (
+                        last_signal_healthy
+                        or last_invalid_log == 0.0
+                        or (now - last_invalid_log) >= 5.0
                     )
-                    last_invalid_log = now
-                last_signal_healthy = False
+                    if should_log:
+                        print(
+                            "[WARN] RC signal invalid "
+                            f"ch-C={frame.pulse_us['C']} "
+                            f"ch-D={frame.pulse_us['D']} "
+                            f"ch-H={frame.pulse_us['H']}"
+                        )
+                        last_invalid_log = now
+                    last_signal_healthy = False
+                    v_ramped = 0.0
+                    w_ramped = 0.0
+                else:
+                    if not last_signal_healthy:
+                        print("RC signal recovered")
+                    last_signal_healthy = True
+
+                    v_sign = -1.0 if args.invert_v else 1.0
+                    w_sign = -1.0 if args.invert_w else 1.0
+                    v_target_raw = v_sign * _axis_value(cmd, args.v_axis) * max_v_mps * cmd.output_scale
+                    w_target_raw = w_sign * _axis_value(cmd, args.w_axis) * args.max_w_radps * cmd.output_scale
+                    if v_target_raw < 0.0:
+                        # Mirror steering while reversing so stick direction matches the turn feel in reverse.
+                        w_target_raw = -w_target_raw
+                    if args.enable_rate_limit:
+                        v_ramped = _rate_limit_axis(
+                            v_target_raw,
+                            v_ramped,
+                            args.v_accel_limit_mps2,
+                            args.v_decel_limit_mps2,
+                            dt,
+                        )
+                        w_ramped = _rate_limit_axis(
+                            w_target_raw,
+                            w_ramped,
+                            args.w_accel_limit_radps2,
+                            args.w_decel_limit_radps2,
+                            dt,
+                        )
+                    else:
+                        v_ramped = v_target_raw
+                        w_ramped = w_target_raw
+
+                    limited_v, limited_w, left_cmd_rpm, right_cmd_rpm = bridge.apply_body_velocity(v_ramped, w_ramped)
+
+                    if args.verbose:
+                        print(
+                            f"v={limited_v:.3f} m/s w={limited_w:.3f} rad/s "
+                            f"axisC={cmd.axis_c:.3f} axisD={cmd.axis_d:.3f} "
+                            f"scale={cmd.output_scale:.3f} level={cmd.speed_level} "
+                            f"v_target={v_target_raw:.3f} w_target={w_target_raw:.3f} "
+                            f"v_ramped={v_ramped:.3f} w_ramped={w_ramped:.3f} "
+                            f"rpmL={left_cmd_rpm:.0f} rpmR={right_cmd_rpm:.0f} "
+                            f"pulse=({frame.pulse_us['C']},{frame.pulse_us['D']},{frame.pulse_us['H']})"
+                        )
+            except ModbusTimeoutError as exc:
+                print(f"[WARN] Modbus timeout: {exc}. Reconnecting and retrying...", file=sys.stderr)
                 v_ramped = 0.0
                 w_ramped = 0.0
-            else:
-                if not last_signal_healthy:
-                    print("RC signal recovered")
-                last_signal_healthy = True
-
-                v_sign = -1.0 if args.invert_v else 1.0
-                w_sign = -1.0 if args.invert_w else 1.0
-                v_target_raw = v_sign * _axis_value(cmd, args.v_axis) * max_v_mps * cmd.output_scale
-                w_target_raw = w_sign * _axis_value(cmd, args.w_axis) * args.max_w_radps * cmd.output_scale
-                if args.enable_rate_limit:
-                    v_ramped = _rate_limit_axis(
-                        v_target_raw,
-                        v_ramped,
-                        args.v_accel_limit_mps2,
-                        args.v_decel_limit_mps2,
-                        dt,
-                    )
-                    w_ramped = _rate_limit_axis(
-                        w_target_raw,
-                        w_ramped,
-                        args.w_accel_limit_radps2,
-                        args.w_decel_limit_radps2,
-                        dt,
-                    )
-                else:
-                    v_ramped = v_target_raw
-                    w_ramped = w_target_raw
-
-                limited_v, limited_w, left_cmd_rpm, right_cmd_rpm = bridge.apply_body_velocity(v_ramped, w_ramped)
-
-                if args.verbose:
+                try:
+                    bridge.reconnect()
+                except ModbusTimeoutError as reconnect_exc:
                     print(
-                        f"v={limited_v:.3f} m/s w={limited_w:.3f} rad/s "
-                        f"axisC={cmd.axis_c:.3f} axisD={cmd.axis_d:.3f} "
-                        f"scale={cmd.output_scale:.3f} level={cmd.speed_level} "
-                        f"v_target={v_target_raw:.3f} w_target={w_target_raw:.3f} "
-                        f"v_ramped={v_ramped:.3f} w_ramped={w_ramped:.3f} "
-                        f"rpmL={left_cmd_rpm:.0f} rpmR={right_cmd_rpm:.0f} "
-                        f"pulse=({frame.pulse_us['C']},{frame.pulse_us['D']},{frame.pulse_us['H']})"
+                        f"[WARN] Modbus reconnect timeout: {reconnect_exc}. "
+                        "Will retry next loop.",
+                        file=sys.stderr,
                     )
+                time.sleep(args.loop_interval)
+                continue
 
             time.sleep(args.loop_interval)
 
