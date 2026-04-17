@@ -39,7 +39,7 @@ else:
     GPIO_IMPORT_ERROR = None
 
 
-DEFAULT_MAX_V_KMH = 1.89
+DEFAULT_MAX_V_KMH = 1.89/2
 DEFAULT_MAX_W_RADPS = 3.14/2
 
 MIN_ACCEPTED_PULSE_US = 750
@@ -79,7 +79,7 @@ class MotorBridgeConfig:
     reduction_ratio: float = 20.0
     max_rpm: float = 2600.0
     min_rpm: float = 80.0
-    anti_creep_start_rpm: float = 120.0
+    anti_creep_start_rpm: float = 200.0
     left_motor_sign: int = DEFAULT_LEFT_MOTOR_SIGN
     right_motor_sign: int = DEFAULT_RIGHT_MOTOR_SIGN
     deceleration_stop: bool = True
@@ -478,6 +478,35 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--signal-timeout-ms", type=int, default=100, help="signal timeout [ms]")
     parser.add_argument("--loop-interval", type=float, default=0.05, help="control loop interval [s]")
+    parser.add_argument(
+        "--enable-rate-limit",
+        action="store_true",
+        help="enable slew-rate limiting for smoother accel/decel (default: disabled)",
+    )
+    parser.add_argument(
+        "--v-accel-limit-mps2",
+        type=float,
+        default=0.20,
+        help="max linear acceleration [m/s^2]",
+    )
+    parser.add_argument(
+        "--v-decel-limit-mps2",
+        type=float,
+        default=0.25,
+        help="max linear deceleration [m/s^2]",
+    )
+    parser.add_argument(
+        "--w-accel-limit-radps2",
+        type=float,
+        default=1.00,
+        help="max angular acceleration [rad/s^2]",
+    )
+    parser.add_argument(
+        "--w-decel-limit-radps2",
+        type=float,
+        default=1.20,
+        help="max angular deceleration [rad/s^2]",
+    )
 
     parser.add_argument("--ch-c-pin", type=int, default=24, help="BCM pin for CH-C")
     parser.add_argument("--ch-d-pin", type=int, default=4, help="BCM pin for CH-D")
@@ -529,6 +558,31 @@ def _axis_value(cmd: VehicleCommand, axis: str) -> float:
     raise ValueError(f"unknown axis: {axis}")
 
 
+def _rate_limit_axis(
+    target: float,
+    current: float,
+    accel_limit: float,
+    decel_limit: float,
+    dt: float,
+) -> float:
+    if dt <= 0.0:
+        return current
+    if target == current:
+        return target
+
+    limit = accel_limit if target > current else decel_limit
+    if limit <= 0.0:
+        return target
+
+    step = limit * dt
+    error = target - current
+    if error > step:
+        return current + step
+    if error < -step:
+        return current - step
+    return target
+
+
 def _validate_args(args: argparse.Namespace) -> None:
     if args.max_v_kmh <= 0.0:
         raise ValueError("--max-v-kmh must be > 0")
@@ -542,6 +596,15 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--signal-timeout-ms must be > 0")
     if args.output_scale_steps < 1:
         raise ValueError("--output-scale-steps must be >= 1")
+    if args.enable_rate_limit:
+        if args.v_accel_limit_mps2 <= 0.0:
+            raise ValueError("--v-accel-limit-mps2 must be > 0 when --enable-rate-limit is set")
+        if args.v_decel_limit_mps2 <= 0.0:
+            raise ValueError("--v-decel-limit-mps2 must be > 0 when --enable-rate-limit is set")
+        if args.w_accel_limit_radps2 <= 0.0:
+            raise ValueError("--w-accel-limit-radps2 must be > 0 when --enable-rate-limit is set")
+        if args.w_decel_limit_radps2 <= 0.0:
+            raise ValueError("--w-decel-limit-radps2 must be > 0 when --enable-rate-limit is set")
     if args.anti_creep_start_rpm < args.min_rpm:
         raise ValueError("--anti-creep-start-rpm must be >= --min-rpm")
     if args.anti_creep_start_rpm > args.max_rpm:
@@ -615,6 +678,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                 f"max_v={max_v_mps:.3f} m/s ({args.max_v_kmh:.2f} km/h), "
                 f"max_w={args.max_w_radps:.3f} rad/s, "
                 f"h_reduction={args.h_reduction}, "
+                f"rate_limit={'on' if args.enable_rate_limit else 'off'}, "
                 f"dry_run={args.dry_run}"
             )
             print(
@@ -627,8 +691,14 @@ def main(argv: Optional[list[str]] = None) -> int:
 
         last_signal_healthy = True
         last_invalid_log = 0.0
+        last_loop_time = time.monotonic()
+        v_ramped = 0.0
+        w_ramped = 0.0
 
         while running:
+            loop_now = time.monotonic()
+            dt = max(0.0, loop_now - last_loop_time)
+            last_loop_time = loop_now
             frame = receiver.read()
             cmd = control.update(frame, channel_config)
 
@@ -649,6 +719,8 @@ def main(argv: Optional[list[str]] = None) -> int:
                     )
                     last_invalid_log = now
                 last_signal_healthy = False
+                v_ramped = 0.0
+                w_ramped = 0.0
             else:
                 if not last_signal_healthy:
                     print("RC signal recovered")
@@ -656,16 +728,36 @@ def main(argv: Optional[list[str]] = None) -> int:
 
                 v_sign = -1.0 if args.invert_v else 1.0
                 w_sign = -1.0 if args.invert_w else 1.0
-                v_target = v_sign * _axis_value(cmd, args.v_axis) * max_v_mps * cmd.output_scale
-                w_target = w_sign * _axis_value(cmd, args.w_axis) * args.max_w_radps * cmd.output_scale
+                v_target_raw = v_sign * _axis_value(cmd, args.v_axis) * max_v_mps * cmd.output_scale
+                w_target_raw = w_sign * _axis_value(cmd, args.w_axis) * args.max_w_radps * cmd.output_scale
+                if args.enable_rate_limit:
+                    v_ramped = _rate_limit_axis(
+                        v_target_raw,
+                        v_ramped,
+                        args.v_accel_limit_mps2,
+                        args.v_decel_limit_mps2,
+                        dt,
+                    )
+                    w_ramped = _rate_limit_axis(
+                        w_target_raw,
+                        w_ramped,
+                        args.w_accel_limit_radps2,
+                        args.w_decel_limit_radps2,
+                        dt,
+                    )
+                else:
+                    v_ramped = v_target_raw
+                    w_ramped = w_target_raw
 
-                limited_v, limited_w, left_cmd_rpm, right_cmd_rpm = bridge.apply_body_velocity(v_target, w_target)
+                limited_v, limited_w, left_cmd_rpm, right_cmd_rpm = bridge.apply_body_velocity(v_ramped, w_ramped)
 
                 if args.verbose:
                     print(
                         f"v={limited_v:.3f} m/s w={limited_w:.3f} rad/s "
                         f"axisC={cmd.axis_c:.3f} axisD={cmd.axis_d:.3f} "
                         f"scale={cmd.output_scale:.3f} level={cmd.speed_level} "
+                        f"v_target={v_target_raw:.3f} w_target={w_target_raw:.3f} "
+                        f"v_ramped={v_ramped:.3f} w_ramped={w_ramped:.3f} "
                         f"rpmL={left_cmd_rpm:.0f} rpmR={right_cmd_rpm:.0f} "
                         f"pulse=({frame.pulse_us['C']},{frame.pulse_us['D']},{frame.pulse_us['H']})"
                     )
