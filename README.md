@@ -1,6 +1,8 @@
 # cugo_rs485_motor_control
 
-CuGoV4 + Raspberry Pi 4 で、BLVD10KM (モータ：BLVM510K-G45) を RS485(Modbus RTU) 制御するためのリポジトリです。
+CuGoV4 + Raspberry Pi 4 で、BLVD10KM (モータ：BLVM510K-G45) を RS485(Modbus RTU) 制御するためのリポジトリです。　　
+
+<img src=docs/whole_system.png>
 
 ## ■ 対応範囲
 
